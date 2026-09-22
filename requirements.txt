@@ -1,0 +1,6 @@
+duckdb==1.5.5
+dbt-core==1.12.5
+dbt-duckdb==1.11.0
+psycopg[binary]==3.2.13
+confluent-kafka==2.12.1
+pyarrow==25.0.1
