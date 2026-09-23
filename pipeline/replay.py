@@ -210,17 +210,29 @@ def main() -> int:
                 chunk = events[i:i + args.batch]
                 for ev in chunk:
                     col = col_for.get(ev["status"])
+                    # updated_at carries the business instant of the transition,
+                    # never now(). Debezium's own ts_ms records when the
+                    # connector saw the event, and this replay compresses two
+                    # years of history into under a minute of wall clock, so
+                    # wall-clock stamps would collapse every SCD2 window to
+                    # zero width downstream.
                     if col and ev["ts"] is not None:
                         cur.execute(
                             f'UPDATE commerce."order" '
-                            f"SET order_status = %s, {col} = %s, updated_at = now() "
+                            f"SET order_status = %s, {col} = %s, updated_at = %s "
                             f"WHERE order_id = %s",
-                            (ev["status"], ev["ts"], ev["order_id"]),
+                            (ev["status"], ev["ts"], ev["ts"], ev["order_id"]),
                         )
                     else:
+                        # No backing timestamp for this hop (invoiced,
+                        # processing, or a terminal cancellation). Keep the
+                        # previous business time rather than jumping to wall
+                        # clock; ordering still comes from the LSN.
                         cur.execute(
                             'UPDATE commerce."order" '
-                            "SET order_status = %s, updated_at = now() "
+                            "SET order_status = %s, updated_at = GREATEST("
+                            "  updated_at, COALESCE(delivered_customer_at,"
+                            "  delivered_carrier_at, approved_at, purchased_at)) "
                             "WHERE order_id = %s",
                             (ev["status"], ev["order_id"]),
                         )
@@ -229,12 +241,14 @@ def main() -> int:
                 print(f"  transitions {done:,}/{len(events):,}", end="\r", flush=True)
             print()
 
-            for uid, zip_code, city, state, _ts in addrs:
+            # ts is the purchase instant of the order that first carried the new
+            # address, so updated_at is the business time the customer moved.
+            for uid, zip_code, city, state, ts in addrs:
                 cur.execute(
                     "UPDATE commerce.customer "
-                    "SET zip_code_prefix = %s, city = %s, state = %s, updated_at = now() "
+                    "SET zip_code_prefix = %s, city = %s, state = %s, updated_at = %s "
                     "WHERE customer_unique_id = %s",
-                    (zip_code, city, state, uid),
+                    (zip_code, city, state, ts, uid),
                 )
             pg.commit()
             print(f"  address changes {len(addrs):,} applied")

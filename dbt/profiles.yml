@@ -1,0 +1,10 @@
+# The warehouse path comes from CDC_ROOT so the Makefile, the consumer and dbt
+# all agree on one file. env_var fails loudly if it is unset, which is better
+# than silently building into a second database.
+cdc_lakehouse:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('CDC_ROOT') }}/data/warehouse.duckdb"
+      threads: 8

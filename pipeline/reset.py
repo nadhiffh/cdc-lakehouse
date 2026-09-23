@@ -35,7 +35,10 @@ def _connect_api(path: str, method: str = "GET") -> tuple[int, str]:
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode()
-    except urllib.error.URLError as exc:
+    # A restarting worker drops the socket mid-request, which surfaces as
+    # URLError or a bare ConnectionResetError. Both mean "not up yet", so they
+    # are reported as unreachable and left for the caller to retry.
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
         return 0, str(exc)
 
 

@@ -13,12 +13,19 @@ SET search_path TO commerce;
 -- customer_unique_id is the real person; customer_id is a per-order alias.
 -- Profiling: 99,441 customer_id vs 96,096 customer_unique_id.
 -- The dimension keys on the person, so it lives here as its own table.
+--
+-- updated_at holds the *business* instant the row changed, not wall clock.
+-- Debezium's own ts_ms records when the connector observed an event, which is
+-- useless as an SCD2 window bound here: the replay compresses two years of
+-- history into a minute of wall clock, so consecutive versions would collapse
+-- onto the same millisecond. Carrying business time in the row itself is the
+-- normal way an OLTP schema makes its history reconstructable downstream.
 CREATE TABLE customer (
     customer_unique_id   CHAR(32) PRIMARY KEY,
     zip_code_prefix      VARCHAR(8)  NOT NULL,
     city                 VARCHAR(64) NOT NULL,
     state                CHAR(2)     NOT NULL,
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at           TIMESTAMP   NOT NULL
 );
 
 CREATE TABLE seller (
@@ -26,7 +33,7 @@ CREATE TABLE seller (
     zip_code_prefix      VARCHAR(8)  NOT NULL,
     city                 VARCHAR(64) NOT NULL,
     state                CHAR(2)     NOT NULL,
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at           TIMESTAMP   NOT NULL
 );
 
 -- 610 of 32,951 products have no category, so category stays nullable.
@@ -38,7 +45,7 @@ CREATE TABLE product (
     length_cm            INTEGER,
     height_cm            INTEGER,
     width_cm             INTEGER,
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at           TIMESTAMP   NOT NULL
 );
 
 -- order_status is the column CDC exists to track: 392,856 real transitions.
@@ -52,7 +59,9 @@ CREATE TABLE "order" (
     delivered_carrier_at     TIMESTAMP,
     delivered_customer_at    TIMESTAMP,
     estimated_delivery_at    TIMESTAMP NOT NULL,
-    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Business instant of the most recent status transition. Set explicitly by
+    -- the replay so SCD2 windows downstream describe when things happened.
+    updated_at               TIMESTAMP NOT NULL,
     CONSTRAINT order_status_known CHECK (order_status IN (
         'created', 'approved', 'invoiced', 'processing',
         'shipped', 'delivered', 'unavailable', 'canceled'
@@ -70,7 +79,7 @@ CREATE TABLE order_item (
     shipping_limit_at    TIMESTAMP,
     price                NUMERIC(10, 2) NOT NULL CHECK (price > 0),
     freight_value        NUMERIC(10, 2) NOT NULL CHECK (freight_value >= 0),
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMP NOT NULL,
     PRIMARY KEY (order_id, order_item_id)
 );
 

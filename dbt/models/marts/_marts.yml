@@ -1,0 +1,156 @@
+version: 2
+
+models:
+  - name: dim_customer
+    description: >
+      SCD Type 2 customer dimension keyed on customer_unique_id (the real
+      person). 252 customers carry genuine multi-version history from 259
+      replayed address changes.
+    columns:
+      - name: customer_key
+        description: Surrogate key, unique per customer version.
+        tests:
+          - not_null
+          - unique
+      - name: customer_unique_id
+        tests:
+          - not_null
+      - name: version
+        tests:
+          - not_null
+      - name: valid_from
+        tests:
+          - not_null
+      - name: valid_to
+        tests:
+          - not_null
+      - name: is_current
+        tests:
+          - not_null
+    tests:
+      # One version per key per start instant.
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [customer_unique_id, version]
+      # Customer versions come from distinct orders placed at distinct times, so
+      # unlike order status these windows must have real width. A zero-width one
+      # would mean two addresses valid at the same instant.
+      - dbt_utils.expression_is_true:
+          expression: "valid_to > valid_from"
+          config:
+            alias: assert_customer_windows_are_positive_width
+
+  - name: dim_order_status_history
+    description: >
+      SCD Type 2 over order status. One row per status an order held, with the
+      window it held it for. 96,531 orders pass through four states.
+    columns:
+      - name: order_status_key
+        tests:
+          - not_null
+          - unique
+      - name: order_id
+        tests:
+          - not_null
+      - name: order_status
+        tests:
+          - not_null
+          - accepted_values:
+              values: [created, approved, invoiced, processing, shipped, delivered, unavailable, canceled]
+      - name: valid_from
+        tests:
+          - not_null
+      - name: valid_to
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [order_id, version]
+      # Windows may be zero-length (an order can be approved and shipped at the
+      # same recorded instant, flagged as is_instantaneous) but must never run
+      # backwards, which is what the monotonic clamp guarantees.
+      - dbt_utils.expression_is_true:
+          expression: "valid_to >= valid_from"
+          config:
+            alias: assert_status_windows_never_run_backwards
+      - dbt_utils.expression_is_true:
+          expression: "seconds_in_status >= 0 or seconds_in_status is null"
+          config:
+            alias: assert_status_duration_non_negative
+
+  - name: dim_seller
+    description: SCD Type 1. No attribute drift exists in the source.
+    columns:
+      - name: seller_key
+        tests: [not_null, unique]
+      - name: seller_id
+        tests: [not_null, unique]
+
+  - name: dim_product
+    description: SCD Type 1. 610 products have no category, surfaced as 'unknown'.
+    columns:
+      - name: product_key
+        tests: [not_null, unique]
+      - name: product_id
+        tests: [not_null, unique]
+      - name: category_name
+        tests: [not_null]
+
+  - name: fct_orders
+    description: One row per order. Reconciles 1:1 with the source.
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - unique
+      - name: customer_unique_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_unique_id
+      - name: order_status
+        tests:
+          - not_null
+          - accepted_values:
+              values: [created, approved, invoiced, processing, shipped, delivered, unavailable, canceled]
+      - name: item_count
+        tests: [not_null]
+      - name: status_versions
+        tests: [not_null]
+
+  - name: fct_order_items
+    description: >
+      One row per order line item. customer_key resolves to the customer
+      version valid at purchase time, not the current one.
+    columns:
+      - name: order_item_key
+        tests: [not_null, unique]
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('fct_orders')
+              field: order_id
+      - name: customer_key
+        tests: [not_null]
+      - name: product_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_product')
+              field: product_key
+      - name: seller_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_seller')
+              field: seller_key
+      - name: price
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [order_id, order_item_id]

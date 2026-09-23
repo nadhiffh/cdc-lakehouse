@@ -1,0 +1,36 @@
+version: 2
+
+sources:
+  - name: landing
+    description: >
+      Append-only Debezium event log loaded by pipeline/consume.py. One row per
+      change event, never deduplicated, so SCD2 logic can be rebuilt and tested
+      against the full stream.
+    schema: landing
+    tables:
+      - name: cdc_events
+        columns:
+          - name: source_table
+            tests:
+              - not_null
+              - accepted_values:
+                  values: [customer, seller, product, order, order_item]
+          - name: op
+            tests:
+              - not_null
+              - accepted_values:
+                  values: [read, insert, update, delete]
+          - name: pk
+            tests:
+              - not_null
+          - name: lsn
+            description: >
+              Postgres log sequence number. Null for snapshot reads, which is
+              why ordering falls back to kafka_offset.
+        tests:
+          # A streamed (non-snapshot) event without an LSN cannot be ordered,
+          # which would make SCD2 windows arbitrary.
+          - dbt_utils.expression_is_true:
+              expression: "lsn IS NOT NULL OR is_snapshot"
+              config:
+                alias: assert_streamed_events_have_lsn
