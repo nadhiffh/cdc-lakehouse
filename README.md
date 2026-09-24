@@ -260,6 +260,63 @@ CI runs the same sequence on every push, plus the mart assertions.
 
 `make ui` starts Kafka UI on localhost:8080 for browsing topics and messages.
 
+## How this would run in production
+
+The local run is a linear `make` chain because it replays a fixed history. A
+production deployment of the same design changes three things: where the
+orchestrator's boundary sits, what triggers a run, and what has to be true
+before dbt is allowed to build.
+
+**Debezium stays outside the orchestrated graph.** A connector is a continuous
+service, not an asset with a completion event. Modelling it as something
+Dagster materialises would mean either a task that never returns or a fiction
+where "success" means the connector was still alive when it was polled. The
+orchestrated boundary starts at Kafka: the connector is deployed and monitored
+like any long-running service, and the pipeline treats its output topics as the
+external source it depends on.
+
+**The trigger is offset advance, not a cron schedule.** A schedule is wrong in
+both directions here — it runs when nothing has changed, and waits when a
+burst has already landed. A sensor that polls end offsets per topic and fires
+only when they have moved past the last consumed position ties runs to actual
+change volume, and makes an idle source produce no runs rather than a stream of
+empty ones. The position a sensor compares against already exists: `consume`
+runs under a fixed consumer group with autocommit off and commits only after a
+successful load, so the committed group offsets are the durable cursor.
+
+**Four checks block the build, all of them upstream of the warehouse.** Every
+dbt test is a query against DuckDB, so none of them can see a source that
+stopped feeding it. A stalled connector looks exactly like a quiet day. These
+run before the models:
+
+- *Replication slot lag.* `pg_current_wal_lsn()` minus the slot's
+  `confirmed_flush_lsn` is the volume of WAL Postgres is retaining for this
+  consumer. Growing lag is the earliest signal that the connector has stopped
+  keeping up.
+- *Connector and task state.* The Connect REST API reports the connector and
+  each task separately, and a `RUNNING` connector with a `FAILED` task still
+  produces nothing. Both have to be checked.
+- *`pg_replication_slots.wal_status`.* Distinct from lag and the one with real
+  blast radius. An inactive slot stops WAL recycling, so the source OLTP
+  database's disk fills. `extended` is a warning, `lost` means WAL needed for
+  the slot is already gone and a resnapshot is unavoidable. This is the
+  uncomfortable property of CDC: the failure propagates *upstream*, into the
+  transactional system the pipeline was supposed to observe passively.
+- *`kafka_offset` continuity.* A gap between the previous high-water mark and
+  the lowest new offset means events were dropped or the topic was recreated,
+  which is the recoverable form of the duplicate-generation bug described
+  above.
+
+All four are blocking, because bad CDC input produces marts that are internally
+consistent and wrong. The SCD2 tests pass happily on a history that is missing
+its middle.
+
+**`replay.py` never appears in the production graph.** It writes to the source
+database. It exists to manufacture a change stream for a static dataset, and
+an orchestrator that can mutate the OLTP system it reads from is a much worse
+problem than a missing pipeline. In production the change stream comes from the
+application; the orchestrated path starts at Kafka and only ever reads.
+
 ## Security note
 
 This stack has no authentication and is intended for local use only:
