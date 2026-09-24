@@ -1,10 +1,15 @@
--- Order line items. These never change after insert in this source (zero
--- update events across 112,650 rows), so the latest event per key is the row.
+-- Order line items, collapsed to current state: the latest event per
+-- (order_id, order_item_id). These never change after insert in this source
+-- (zero update events across 112,650 rows), but the model does not rely on that.
+--
+-- The delete filter is applied AFTER ranking. See stg_products for why: doing it
+-- before would let a cancelled line item reappear from its original insert.
 
-with latest as (
+with ranked as (
 
     select
         pk,
+        op,
         after,
         row_number() over (
             partition by pk
@@ -12,6 +17,13 @@ with latest as (
         ) as rn
     from {{ source('landing', 'cdc_events') }}
     where source_table = 'order_item'
+
+),
+
+current_state as (
+
+    select * from ranked
+    where rn = 1
       and op <> 'delete'
 
 )
@@ -30,5 +42,4 @@ select
     to_timestamp(cast(json_extract(after, '$.shipping_limit_at') as bigint) / 1000)
         as shipping_limit_at
 
-from latest
-where rn = 1
+from current_state

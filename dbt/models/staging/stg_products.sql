@@ -1,11 +1,21 @@
--- Products. No update events in this source, so latest-per-key is the row.
--- 610 of 32,951 have no category; kept as NULL and surfaced as 'unknown' in
--- the mart rather than dropped.
+-- Products, collapsed to current state: the latest event per product_id.
+--
+-- 610 of 32,951 have no category; kept as NULL here and surfaced as 'unknown'
+-- in the mart rather than dropped.
+--
+-- The delete filter is applied AFTER ranking, not before. Filtering deletes out
+-- of the candidate set first was a real bug: a row whose latest event is a
+-- delete would fall back to its earlier insert and reappear in the mart as
+-- though it were still live. Ranking every event and then discarding keys whose
+-- newest event is a delete is the only order that handles resurrection
+-- correctly, because a key can legitimately be inserted, deleted, and inserted
+-- again.
 
-with latest as (
+with ranked as (
 
     select
         pk,
+        op,
         after,
         row_number() over (
             partition by pk
@@ -13,6 +23,14 @@ with latest as (
         ) as rn
     from {{ source('landing', 'cdc_events') }}
     where source_table = 'product'
+
+),
+
+current_state as (
+
+    select * from ranked
+    where rn = 1
+      -- Dropped only when the most recent event for this key is a delete.
       and op <> 'delete'
 
 )
@@ -26,5 +44,4 @@ select
     cast(json_extract(after, '$.height_cm') as integer) as height_cm,
     cast(json_extract(after, '$.width_cm')  as integer) as width_cm
 
-from latest
-where rn = 1
+from current_state

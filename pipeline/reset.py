@@ -102,6 +102,24 @@ def truncate_tables() -> None:
     print("  postgres tables: truncated")
 
 
+def drop_warehouse() -> None:
+    """Delete the DuckDB warehouse.
+
+    Resetting Postgres and Kafka but leaving the warehouse in place was a bug:
+    the consumer tracks its position in a Kafka consumer group, and once the
+    topics are recreated its committed offsets are meaningless, so the next run
+    reloads the whole stream and appends a second generation on top of the first.
+    That produced 1,279,530 landing rows where 639,764 were expected.
+
+    It was caught by assert_no_duplicate_cdc_generations, the test written for
+    the Kafka-side version of the same mistake.
+    """
+    for path in (config.WAREHOUSE, config.WAREHOUSE.with_suffix(".duckdb.wal")):
+        if path.exists():
+            path.unlink()
+            print(f"  warehouse {path.name}: deleted")
+
+
 def restart_connect() -> None:
     """Restart Kafka Connect after its internal topics are dropped.
 
@@ -121,9 +139,12 @@ def restart_connect() -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="reset Postgres, Kafka and the CDC slot")
+    ap = argparse.ArgumentParser(
+        description="reset Postgres, Kafka, the CDC slot and the warehouse")
     ap.add_argument("--keep-data", action="store_true",
                     help="reset streaming state only, leave table rows in place")
+    ap.add_argument("--keep-warehouse", action="store_true",
+                    help="leave the DuckDB file in place (rarely what you want)")
     args = ap.parse_args()
 
     print("resetting CDC stack:")
@@ -133,6 +154,8 @@ def main() -> int:
     restart_connect()
     if not args.keep_data:
         truncate_tables()
+    if not args.keep_warehouse:
+        drop_warehouse()
     print("\nclean. `make seed` then `make register` starts a fresh snapshot.")
     return 0
 

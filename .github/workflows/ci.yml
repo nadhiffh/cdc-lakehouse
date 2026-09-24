@@ -60,7 +60,7 @@ jobs:
         timeout-minutes: 6
         run: make consume
 
-      - name: dbt build (99 tests)
+      - name: dbt build (100 tests)
         run: make build
 
       # Independent of dbt: asserts the marts hold the row counts the source

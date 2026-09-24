@@ -1,8 +1,13 @@
--- Current state of each order: the last event per order_id.
+-- Current state of each order: the latest event per order_id.
 --
 -- Separate from dim_order_status_history because the fact table needs one row
--- per order, not one per status version. Deriving it from the same event log
--- keeps the two consistent by construction.
+-- per order, not one per status version. Deriving both from the same event log
+-- keeps them consistent by construction.
+--
+-- An order whose newest event is a delete is dropped. The delete filter is
+-- applied after ranking, not before, so a key that was deleted cannot fall back
+-- to an older event and reappear as live. See stg_products for the bug this
+-- ordering prevents.
 
 with ranked as (
 
@@ -13,6 +18,14 @@ with ranked as (
             order by lsn desc, kafka_offset desc
         ) as rn
     from {{ ref('stg_order_events') }}
+
+),
+
+current_state as (
+
+    select * from ranked
+    where rn = 1
+      and op <> 'delete'
 
 )
 
@@ -27,5 +40,4 @@ select
     delivered_at,
     estimated_delivery_date,
     event_at as last_changed_at
-from ranked
-where rn = 1
+from current_state

@@ -5,10 +5,17 @@ Debezium envelope fields needed to order and interpret it. No deduplication,
 no last-write-wins collapsing. dbt does that, so the event history stays
 auditable and the SCD2 logic is testable against the full stream.
 
-Ordering key is (lsn, event_seq) rather than any source timestamp. Postgres
-LSNs are monotonic in commit order, whereas the business timestamps are not:
-1,382 order transitions carry a timestamp earlier than the transition before
-them, so timestamp ordering would produce negative-width SCD2 windows.
+Every row carries both clocks, because downstream needs them for different jobs:
+
+  * (lsn, kafka_offset) orders events. Postgres LSNs are monotonic in commit
+    order, verified to never run backwards or collide across 295,531 streamed
+    events, so this is the only sound total order available.
+  * event_ts_ms is when the connector observed the event. Useful for lineage and
+    CDC latency, useless as an SCD2 window bound: this replay compresses two
+    years of history into under a minute of wall clock.
+
+The business instant of each change travels in the payload itself, as the source
+table's updated_at. That is what bounds the SCD2 windows in the marts.
 """
 
 from __future__ import annotations
@@ -16,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
 
 import duckdb
 import pyarrow as pa
@@ -61,12 +67,6 @@ CREATE TABLE IF NOT EXISTS landing.cdc_events (
     after          JSON
 );
 """
-
-
-def epoch_ms_to_ts(value):
-    if value is None:
-        return None
-    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).replace(tzinfo=None)
 
 
 def primary_key(table: str, payload: dict) -> str:
@@ -124,6 +124,8 @@ def main() -> int:
     con = duckdb.connect(str(config.WAREHOUSE))
     con.execute(DDL)
 
+    existing = con.execute("SELECT count(*) FROM landing.cdc_events").fetchone()[0]
+
     if args.from_beginning:
         con.execute("DELETE FROM landing.cdc_events")
         consumer.assign([TopicPartition(t, 0, 0) for t in topics])
@@ -134,6 +136,26 @@ def main() -> int:
     ends = topic_end_offsets(consumer, topics)
     target = sum(ends.values())
     print(f"kafka holds {target:,} events across {len(topics)} topics")
+
+    # Guard against loading a second generation on top of the first.
+    #
+    # `make reset` recreates the Kafka topics, which resets their offsets to
+    # zero. A resuming consumer then reloads everything, and because the landing
+    # table is append-only the log silently doubles while Postgres and the marts
+    # still look correct. That is exactly what happened: 1,279,530 rows where
+    # 639,764 were expected.
+    #
+    # The check is the only one that actually matters: does the log already hold
+    # at least as many events as Kafka currently has? If so there is nothing to
+    # add, and appending anything would be duplication.
+    if not args.from_beginning and existing >= target > 0:
+        print(f"nothing to do: the log holds {existing:,} events and Kafka has "
+              f"{target:,}.")
+        print("Use --from-beginning to rebuild from scratch, or `make reset` to "
+              "start over.")
+        consumer.close()
+        con.close()
+        return 0
 
     batch: list[tuple] = []
     counts: dict[str, int] = {t: 0 for t in config.CDC_TABLES}
@@ -221,7 +243,10 @@ def main() -> int:
             break
 
     flush()
-    consumer.commit(asynchronous=False)
+    # Committing with nothing consumed raises _NO_OFFSET rather than being a
+    # no-op, which turned an already-up-to-date rerun into a crash.
+    if total:
+        consumer.commit(asynchronous=False)
     consumer.close()
     print(f"  loaded {total:,} events" + " " * 20)
 

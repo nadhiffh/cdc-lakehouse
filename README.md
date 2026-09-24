@@ -6,7 +6,7 @@ them in DuckDB as an append-only event log; dbt builds SCD Type 2 dimensions on
 top.
 
 Verified end to end on a clean rebuild: 639,764 change events, 99,441 orders,
-112,650 line items, 99 dbt tests passing.
+112,650 line items, 100 dbt tests passing.
 
 ![ci](https://github.com/nadhiffh/cdc-lakehouse/actions/workflows/ci.yml/badge.svg)
 
@@ -134,7 +134,7 @@ can be approved and shipped at the same recorded instant.
 
 ## Tests
 
-99 tests run as part of `dbt build`, so a failure halts the graph before bad
+100 tests run as part of `dbt build`, so a failure halts the graph before bad
 data reaches the marts. Beyond uniqueness, not-null, accepted-values and
 referential checks, these target CDC and SCD2 failure modes specifically:
 
@@ -153,6 +153,9 @@ referential checks, these target CDC and SCD2 failure modes specifically:
   version on a no-op update.
 - `assert_no_duplicate_cdc_generations` — more than one snapshot `read` per key
   means the log spans multiple snapshots and every count is inflated. See below.
+- `assert_deleted_rows_do_not_reappear` — a key whose newest event is a delete
+  must be absent from every current-state model. Handles resurrection too, since
+  a key can be inserted, deleted, then inserted again.
 - `assert_fct_orders_reconciles_to_cdc` — fact row count must equal the distinct
   orders in the event log, catching a join fanning out or a filter dropping rows.
 - `assert_order_items_reconcile_between_facts` — guards the 775 order with no
@@ -175,9 +178,10 @@ rows makes `assert_marts` fail on the row count *and* the revenue total, and
 Confirming a test fails when it should is the only way to know it is not passing
 vacuously.
 
-## Two bugs worth documenting
+## Four bugs worth documenting
 
-Both surfaced only on a clean run, which is the argument for testing that way.
+All four surfaced only from testing clean state or exercising an untested branch,
+never from an incremental happy-path run.
 
 **Terminal status derived from timestamps.** The replay first inferred each
 order's final status from which lifecycle timestamps were present. That silently
@@ -193,6 +197,27 @@ on each topic — 288,288 customer events where 96,096 were expected — while
 Postgres itself looked perfectly correct. `make reset` now drops the connector,
 the replication slot and the topics, and restarts Kafka Connect so it recreates
 its internal config topics.
+
+**Deleted rows came back to life.** The staging models filtered
+`op <> 'delete'` *before* ranking events to find the latest one. That removes the
+delete from the candidate set, so the row falls back to its earlier insert and
+reappears as though still live. Found by inserting one product and deleting it:
+it stayed in `dim_product`, and every existing test passed, because uniqueness,
+not-null and referential integrity all still held. Only the absolute row count
+was wrong, by one. Ranking first and discarding keys whose *newest* event is a
+delete is the only order that is correct, and it handles resurrection, since a
+key can legitimately be inserted, deleted and inserted again.
+
+**Resetting the stack doubled the event log.** `make reset` cleared Postgres and
+Kafka but left the DuckDB file in place. Recreating the topics resets their
+offsets to zero, so the resuming consumer reloaded the entire stream and appended
+it to an append-only table: 1,279,530 landing rows where 639,764 were expected.
+Caught by `assert_no_duplicate_cdc_generations`, the test written for the
+Kafka-side version of the same mistake, which is the argument for writing
+invariants rather than regression tests for specific incidents. `reset` now drops
+the warehouse too, and `consume` is idempotent: rerunning it against an
+up-to-date log reports there is nothing to do instead of duplicating, while still
+picking up genuinely new events.
 
 ## Setup
 
@@ -214,7 +239,7 @@ make register   # register the Debezium connector, triggers the snapshot
 make replay     # apply 295,272 transitions + 259 address changes
 make verify     # assert Kafka matches Postgres exactly
 make consume    # drain the topics into DuckDB
-make build      # dbt build: 6 models, 99 tests
+make build      # dbt build: 6 models, 100 tests
 ```
 
 Or the whole thing from nothing:
