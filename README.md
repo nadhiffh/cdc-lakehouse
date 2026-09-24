@@ -6,7 +6,7 @@ them in DuckDB as an append-only event log; dbt builds SCD Type 2 dimensions on
 top.
 
 Verified end to end on a clean rebuild: 639,764 change events, 99,441 orders,
-112,650 line items, 100 dbt tests passing.
+112,650 line items, 12 models and 88 data tests passing.
 
 ![ci](https://github.com/nadhiffh/cdc-lakehouse/actions/workflows/ci.yml/badge.svg)
 
@@ -134,7 +134,7 @@ can be approved and shipped at the same recorded instant.
 
 ## Tests
 
-100 tests run as part of `dbt build`, so a failure halts the graph before bad
+88 data tests run as part of `dbt build`, so a failure halts the graph before bad
 data reaches the marts. Beyond uniqueness, not-null, accepted-values and
 referential checks, these target CDC and SCD2 failure modes specifically:
 
@@ -239,7 +239,7 @@ make register   # register the Debezium connector, triggers the snapshot
 make replay     # apply 295,272 transitions + 259 address changes
 make verify     # assert Kafka matches Postgres exactly
 make consume    # drain the topics into DuckDB
-make build      # dbt build: 6 models, 100 tests
+make build      # dbt build: 12 models, 88 data tests
 ```
 
 Or the whole thing from nothing:
