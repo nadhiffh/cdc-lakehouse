@@ -19,9 +19,26 @@ import sys
 from datetime import datetime, timezone
 
 import duckdb
+import pyarrow as pa
 from confluent_kafka import Consumer, KafkaError, TopicPartition
 
 from pipeline import config
+
+# Column order for the Arrow batch handed to DuckDB. Must match INSERT_COLUMNS.
+ARROW_SCHEMA = pa.schema([
+    ("source_table", pa.string()),
+    ("op", pa.string()),
+    ("lsn", pa.int64()),
+    ("tx_id", pa.int64()),
+    ("event_ts_ms", pa.int64()),
+    ("is_snapshot", pa.bool_()),
+    ("kafka_offset", pa.int64()),
+    ("pk", pa.string()),
+    ("before", pa.string()),
+    ("after", pa.string()),
+])
+
+INSERT_COLUMNS = ", ".join(f.name for f in ARROW_SCHEMA)
 
 # Debezium op codes: r=snapshot read, c=insert, u=update, d=delete.
 OP_NAMES = {"r": "read", "c": "insert", "u": "update", "d": "delete"}
@@ -82,6 +99,8 @@ def main() -> int:
                     help="read the topics from offset 0 and rebuild the log")
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="seconds to wait for new messages before stopping")
+    ap.add_argument("--batch-size", type=int, default=50_000,
+                    help="events per columnar insert")
     args = ap.parse_args()
 
     topics = [
@@ -95,6 +114,11 @@ def main() -> int:
         "group.id": "cdc-duckdb-loader",
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
+        # Defaults fetch conservatively, which shows up as latency per poll when
+        # draining a backlog of 639,764 events rather than tailing a live stream.
+        "fetch.min.bytes": 1_048_576,
+        "fetch.wait.max.ms": 100,
+        "queued.max.messages.kbytes": 262_144,
     })
 
     con = duckdb.connect(str(config.WAREHOUSE))
@@ -118,15 +142,30 @@ def main() -> int:
     empty_polls = 0
 
     def flush() -> None:
+        """Insert the batch columnar, via Arrow.
+
+        executemany was the first implementation and cost about 430 events per
+        second regardless of batch size: DuckDB's Python API binds and appends
+        row by row. On a 2-core CI runner that turned 639,764 events into 25
+        minutes and blew the job's time budget. Handing DuckDB one Arrow table
+        per batch moves the work into its native columnar append path.
+        """
         if not batch:
             return
-        con.executemany(
-            "INSERT INTO landing.cdc_events "
-            "(source_table, op, lsn, tx_id, event_ts_ms, is_snapshot, "
-            " kafka_offset, pk, before, after) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            batch,
+        # zip(*batch) transposes rows into columns without copying the values.
+        columns = list(zip(*batch))
+        arrow_batch = pa.table(
+            {field.name: pa.array(col, type=field.type)
+             for field, col in zip(ARROW_SCHEMA, columns)},
+            schema=ARROW_SCHEMA,
         )
+        # Registered as a view so the INSERT reads straight from Arrow memory.
+        con.register("arrow_batch", arrow_batch)
+        con.execute(
+            f"INSERT INTO landing.cdc_events ({INSERT_COLUMNS}) "
+            f"SELECT {INSERT_COLUMNS} FROM arrow_batch"
+        )
+        con.unregister("arrow_batch")
         batch.clear()
 
     while True:
@@ -174,7 +213,7 @@ def main() -> int:
         ops[OP_NAMES.get(op, op)] = ops.get(OP_NAMES.get(op, op), 0) + 1
         total += 1
 
-        if len(batch) >= 10_000:
+        if len(batch) >= args.batch_size:
             flush()
             print(f"  loaded {total:,}/{target:,}", end="\r", flush=True)
 

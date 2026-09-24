@@ -64,6 +64,13 @@ on money. Prices arrive as strings and are cast to `DECIMAL(10,2)`, so
 SCD2 logic is rebuildable and testable against the full stream. Collapsing to
 latest-per-key at load time would make the history unauditable.
 
+**Columnar inserts via Arrow.** The consumer first used `executemany`, which
+cost a flat ~430 events/sec because DuckDB's Python API binds and appends row by
+row. That is tolerable locally and fatal in CI: 639,764 events took 25 minutes on
+a 2-core runner and consumed the entire job budget. Batching into an Arrow table
+and inserting from a registered view uses DuckDB's native columnar append path,
+which brought the same load to 11 seconds locally.
+
 **SCD Type 2 only where history exists.** `dim_customer` and
 `dim_order_status_history` carry real history. `dim_seller` and `dim_product`
 are Type 1 because profiling found zero attribute drift across all 3,095

@@ -8,7 +8,9 @@ on:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The pipeline runs in about 6 minutes on a 2-core runner. The headroom is
+    # for Docker image pulls, which dominate a cold run.
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -51,7 +53,11 @@ jobs:
       - name: Verify Kafka matches Postgres
         run: make verify
 
+      # Bounded explicitly: this step once regressed from seconds to 25 minutes
+      # and consumed the whole job budget, which surfaced as a confusing timeout
+      # on the *next* step rather than a failure here.
       - name: Consume into DuckDB
+        timeout-minutes: 6
         run: make consume
 
       - name: dbt build (99 tests)
