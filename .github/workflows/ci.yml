@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.12
+          uv pip install -r requirements.txt
+
+      - name: Download source data
+        run: make data
+
+      # Runs the same clean-state path as `make rebuild`, which is the only path
+      # that caught either of the two real bugs in this project. Steps are
+      # explicit rather than a single `make rebuild` so a failure names the stage.
+      - name: Start CDC stack
+        run: make up
+
+      - name: Seed Postgres
+        run: make seed
+
+      - name: Register Debezium connector
+        run: make register
+
+      - name: Wait for snapshot
+        run: make wait-snapshot
+
+      - name: Replay change stream
+        run: make replay
+
+      - name: Wait for stream to drain
+        run: make wait-stream
+
+      - name: Verify Kafka matches Postgres
+        run: make verify
+
+      - name: Consume into DuckDB
+        run: make consume
+
+      - name: dbt build (99 tests)
+        run: make build
+
+      # Independent of dbt: asserts the marts hold the row counts the source
+      # implies, so a silently-empty warehouse cannot pass as green.
+      - name: Assert mart row counts
+        run: .venv/bin/python -m pipeline.assert_marts
+
+      - name: Dump Debezium logs on failure
+        if: failure()
+        run: docker compose logs --tail 200 connect postgres kafka
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

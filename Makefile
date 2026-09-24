@@ -23,13 +23,19 @@ down:
 seed:
 	$(VENV)/python -m pipeline.seed
 
+# PUT to /config rather than POST to /connectors, so re-registering an existing
+# connector updates it instead of failing with 409.
 register:
-	curl -sf -X POST -H "Content-Type: application/json" \
-		--data @$(CONNECTOR) http://localhost:8083/connectors \
-		| python3 -m json.tool
+	@curl -sf -X PUT -H "Content-Type: application/json" \
+		--data "$$(python3 -c 'import json,sys; print(json.dumps(json.load(open("$(CONNECTOR)"))["config"]))')" \
+		http://localhost:8083/connectors/commerce-connector/config > /dev/null \
+		&& echo "connector registered" || { echo "connector registration failed"; exit 1; }
 
 replay:
 	$(VENV)/python -m pipeline.replay
+
+consume:
+	$(VENV)/python -m pipeline.consume
 
 verify:
 	$(VENV)/python -m pipeline.verify_stream
@@ -40,11 +46,27 @@ verify:
 reset:
 	$(VENV)/python -m pipeline.reset
 
-build:
+deps:
+	cd dbt && $(CURDIR)/$(VENV)/dbt deps
+
+build: deps
 	cd dbt && $(CURDIR)/$(VENV)/dbt build
 
-test:
+test: deps
 	cd dbt && $(CURDIR)/$(VENV)/dbt test
+
+# Full pipeline from a genuinely clean state. This is the path that surfaced
+# both real bugs in this project, so it is the one worth running before a push.
+# `wait-snapshot` blocks until Debezium finishes the initial snapshot, otherwise
+# replay would race it and the reconciliation would compare partial state.
+rebuild: reset seed register wait-snapshot replay wait-stream consume build
+	@echo "clean rebuild complete"
+
+wait-snapshot:
+	$(VENV)/python -m pipeline.wait --for snapshot
+
+wait-stream:
+	$(VENV)/python -m pipeline.wait --for stream
 
 logs:
 	docker compose logs -f connect
