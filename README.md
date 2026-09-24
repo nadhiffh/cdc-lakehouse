@@ -8,6 +8,8 @@ top.
 Verified end to end on a clean rebuild: 639,764 change events, 99,441 orders,
 112,650 line items, 99 dbt tests passing.
 
+![ci](https://github.com/nadhiffh/cdc-lakehouse/actions/workflows/ci.yml/badge.svg)
+
 ## Architecture
 
 ```
